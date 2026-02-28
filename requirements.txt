@@ -1,0 +1,15 @@
+# CapCut 모션 자동화 도구 - 의존성 목록
+
+# EXE 빌드용 (선택사항)
+pyinstaller>=6.0.0
+
+# 참고: 이 프로그램은 Python 표준 라이브러리만 사용합니다.
+# 따라서 Python 3.7 이상만 설치되어 있으면 추가 패키지 없이 실행 가능합니다.
+#
+# 사용 중인 표준 라이브러리:
+# - tkinter (GUI)
+# - json (JSON 파일 처리)
+# - random (랜덤 값 생성)
+# - uuid (고유 ID 생성)
+# - os, pathlib (파일 시스템)
+# - datetime (타임스탬프)

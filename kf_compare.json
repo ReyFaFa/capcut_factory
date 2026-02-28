@@ -1,0 +1,185 @@
+{
+  "current_clip": {
+    "scale": {
+      "x": 1.04,
+      "y": 1.04
+    },
+    "rotation": 0.0,
+    "transform": {
+      "x": 0.0,
+      "y": 0.0
+    },
+    "flip": {
+      "vertical": false,
+      "horizontal": false
+    },
+    "alpha": 1.0
+  },
+  "backup_clip": {
+    "scale": {
+      "x": 1.04,
+      "y": 1.04
+    },
+    "rotation": 0.0,
+    "transform": {
+      "x": 0.0,
+      "y": 0.0
+    },
+    "flip": {
+      "vertical": false,
+      "horizontal": false
+    },
+    "alpha": 1.0
+  },
+  "current_kf_len": 3,
+  "backup_kf_len": 3,
+  "backup_kf_sample": [
+    {
+      "id": "56C441DD-248D-470A-AA22-6B1B8797D650",
+      "material_id": "",
+      "property_type": "KFTypePositionX",
+      "keyframe_list": [
+        {
+          "id": "538DEEC7-AE2F-4BE4-B18E-3DD4FC7C60EE",
+          "curveType": "Line",
+          "time_offset": 0,
+          "left_control": {
+            "x": 0.0,
+            "y": 0.0
+          },
+          "right_control": {
+            "x": 0.0,
+            "y": 0.0
+          },
+          "values": [
+            0.0
+          ],
+          "string_value": "",
+          "graphID": ""
+        },
+        {
+          "id": "10A6ADE5-1CA5-48EE-99B0-39CE63CABADF",
+          "curveType": "Line",
+          "time_offset": 9800000,
+          "left_control": {
+            "x": 0.0,
+            "y": 0.0
+          },
+          "right_control": {
+            "x": 0.0,
+            "y": 0.0
+          },
+          "values": [
+            -0.002512
+          ],
+          "string_value": "",
+          "graphID": ""
+        }
+      ]
+    },
+    {
+      "id": "8AE2B975-D6CF-48DC-9561-4C988414B423",
+      "material_id": "",
+      "property_type": "KFTypePositionY",
+      "keyframe_list": [
+        {
+          "id": "4351D82C-E048-487E-BCD1-0195C1940D57",
+          "curveType": "Line",
+          "time_offset": 0,
+          "left_control": {
+            "x": 0.0,
+            "y": 0.0
+          },
+          "right_control": {
+            "x": 0.0,
+            "y": 0.0
+          },
+          "values": [
+            0.0
+          ],
+          "string_value": "",
+          "graphID": ""
+        },
+        {
+          "id": "D80F4F9C-78B9-4065-BB24-2A1B0D7B0F2A",
+          "curveType": "Line",
+          "time_offset": 9800000,
+          "left_control": {
+            "x": 0.0,
+            "y": 0.0
+          },
+          "right_control": {
+            "x": 0.0,
+            "y": 0.0
+          },
+          "values": [
+            0.011415
+          ],
+          "string_value": "",
+          "graphID": ""
+        }
+      ]
+    },
+    {
+      "id": "E291B85F-F8A2-46EC-AFE1-5A5FC663FAFD",
+      "material_id": "",
+      "property_type": "KFTypeScaleX",
+      "keyframe_list": [
+        {
+          "id": "3FF120C2-300E-4E2F-90E8-18D3CA624671",
+          "curveType": "Line",
+          "time_offset": 0,
+          "left_control": {
+            "x": 0.0,
+            "y": 0.0
+          },
+          "right_control": {
+            "x": 0.0,
+            "y": 0.0
+          },
+          "values": [
+            1.04
+          ],
+          "string_value": "",
+          "graphID": ""
+        },
+        {
+          "id": "1712884E-9ECF-4c13-982E-53A7A4847F4D",
+          "curveType": "Line",
+          "time_offset": 7280000,
+          "left_control": {
+            "x": 0.0,
+            "y": 0.0
+          },
+          "right_control": {
+            "x": 0.0,
+            "y": 0.0
+          },
+          "values": [
+            1.04
+          ],
+          "string_value": "",
+          "graphID": ""
+        },
+        {
+          "id": "B646CAC0-0629-4C1D-9A85-012544AB76CA",
+          "curveType": "Line",
+          "time_offset": 9800000,
+          "left_control": {
+            "x": 0.0,
+            "y": 0.0
+          },
+          "right_control": {
+            "x": 0.0,
+            "y": 0.0
+          },
+          "values": [
+            1.127024
+          ],
+          "string_value": "",
+          "graphID": ""
+        }
+      ]
+    }
+  ]
+}

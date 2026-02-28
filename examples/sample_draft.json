@@ -1,0 +1,41 @@
+{
+  "tracks": [
+    {
+      "type": "video",
+      "segments": [
+        {
+          "clip": {
+            "scale": {
+              "x": 1.0,
+              "y": 1.0
+            },
+            "transform": {
+              "x": 0.0,
+              "y": 0.0
+            }
+          },
+          "target_timerange": {
+            "duration": 3000000
+          },
+          "common_keyframes": []
+        },
+        {
+          "clip": {
+            "scale": {
+              "x": 1.0,
+              "y": 1.0
+            },
+            "transform": {
+              "x": 0.0,
+              "y": 0.0
+            }
+          },
+          "target_timerange": {
+            "duration": 2500000
+          },
+          "common_keyframes": []
+        }
+      ]
+    }
+  ]
+}
