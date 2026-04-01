@@ -78,15 +78,25 @@ class Win32DropHandler:
         return user32.CallWindowProcW(self._old_proc, hwnd, msg, wparam, lparam)
 
     def _handle_drop(self, hdrop):
-        count = shell32.DragQueryFileW(hdrop, 0xFFFFFFFF, None, 0)
-        files = []
-        for i in range(count):
-            buf = create_unicode_buffer('', MAX_PATH)
-            shell32.DragQueryFileW(hdrop, i, buf, MAX_PATH)
-            files.append(buf[:].split('\0', 1)[0])
-        shell32.DragFinish(hdrop)
-        if files:
-            self.root.after(10, self.callback, files[0])
+        try:
+            count = shell32.DragQueryFileW(hdrop, 0xFFFFFFFF, None, 0)
+            files = []
+            for i in range(count):
+                buf = create_unicode_buffer('', MAX_PATH)
+                shell32.DragQueryFileW(hdrop, i, buf, MAX_PATH)
+                path = buf[:].split('\0', 1)[0]
+                if path:
+                    files.append(path)
+            shell32.DragFinish(hdrop)
+            if files:
+                # Use after to move callback execution out of the window procedure context
+                self.root.after(10, self.callback, files[0])
+        except Exception as e:
+            print(f"Error handling drop: {e}")
+            try:
+                shell32.DragFinish(hdrop)
+            except:
+                pass
 
 
 # ============================================================
@@ -168,6 +178,7 @@ class SubtitleExtractor:
 
                 subtitles.append({
                     "index": idx,
+                    "srt_index": idx + 1,  # 1-based SRT subtitle index
                     "material_id": mat_id,
                     "text": text,
                     "start": start,
@@ -178,6 +189,9 @@ class SubtitleExtractor:
                 idx += 1
 
         subtitles.sort(key=lambda s: s["start"])
+        # Re-assign srt_index after sorting by time (1-based)
+        for i, sub in enumerate(subtitles):
+            sub["srt_index"] = i + 1
         return subtitles
 
     @staticmethod
@@ -212,6 +226,9 @@ class ImageIndexer:
         re.IGNORECASE
     )
 
+    # Korean text extraction: match consecutive Korean syllables/jamo + spaces
+    KOREAN_PATTERN = re.compile(r'[\uAC00-\uD7A3\u1100-\u11FF\u3130-\u318F]+')
+
     @staticmethod
     def index(folder_path):
         images = {}
@@ -226,22 +243,22 @@ class ImageIndexer:
             raw_name = os.path.splitext(filename)[0]
             text = ImageIndexer._extract_text(raw_name)
             scene_number = ImageIndexer._extract_number(raw_name)
+            korean_text = ImageIndexer._extract_korean_text(raw_name)
             normalized = TextMatcher.normalize(text)
+            korean_normalized = TextMatcher.normalize(korean_text)
 
-            # Even if text is empty, if we have a scene number, we should index it
-            # We'll use the raw_name + some uniqueness if normalized is empty but we have a number
-            key = normalized if normalized else f"__num_{scene_number}_{raw_name}"
-
-            if key:
-                full_path = os.path.join(folder_path, filename)
-                images[key] = {
-                    "filename": filename,
-                    "path": full_path,
-                    "raw_name": raw_name,
-                    "text": text,
-                    "scene_number": scene_number,
-                    "normalized": normalized
-                }
+            # Use raw_name as unique key to preserve duplicate scene numbers
+            full_path = os.path.join(folder_path, filename)
+            images[raw_name] = {
+                "filename": filename,
+                "path": full_path,
+                "raw_name": raw_name,
+                "text": text,
+                "korean_text": korean_text,
+                "scene_number": scene_number,
+                "normalized": normalized,
+                "korean_normalized": korean_normalized,
+            }
         return images
 
     @staticmethod
@@ -251,6 +268,17 @@ class ImageIndexer:
         # Replace underscores with spaces
         text = text.replace('_', ' ').strip()
         return text
+
+    @staticmethod
+    def _extract_korean_text(raw_name):
+        """Extract only Korean text from filename (ignoring English tags like MCR, medium_shot etc)"""
+        # Replace underscores with spaces first
+        name_spaced = raw_name.replace('_', ' ')
+        # Find all Korean character sequences
+        korean_parts = ImageIndexer.KOREAN_PATTERN.findall(name_spaced)
+        if korean_parts:
+            return ' '.join(korean_parts)
+        return ""
 
     @staticmethod
     def _extract_number(raw_name):
@@ -281,76 +309,111 @@ class TextMatcher:
         return text
 
     @staticmethod
-    def match(subtitles, image_index):
+    def match(subtitles, image_index, match_mode="script"):
+        """Match subtitles to images.
+        match_mode:
+          'srt_index' (Type A) = Index-only matching (ignores text)
+          'script'    (Type B) = Subtitle-only matching (ignores index during initial match, followed by gap filling)
+        """
         results = []
         used_images = set()
 
-        for i, sub in enumerate(subtitles):
-            seq = i + 1  # 1-based chronological sequence
-            sub_norm = TextMatcher.normalize(sub["text"])
-            
-            best_match = None
-            best_score = -1
-            match_type = "none"
-            best_key = None
+        if match_mode == "srt_index":
+            # --- Mode A: Index-only matching ---
+            for i, sub in enumerate(subtitles):
+                seq = i + 1
+                srt_idx = sub.get("srt_index", seq)
+                
+                matched_images = []
+                for img_key, img_data in image_index.items():
+                    if img_data.get("scene_number") == srt_idx:
+                        matched_images.append(img_data)
+                        used_images.add(img_key)
+                
+                primary_image = matched_images[0] if matched_images else None
+                results.append({
+                    "index": sub["index"],
+                    "seq": seq,
+                    "srt_index": srt_idx,
+                    "subtitle": sub,
+                    "image": primary_image,
+                    "images": matched_images,
+                    "status": "matched" if primary_image else "unmatched",
+                    "match_type": "index_match" if primary_image else "none",
+                })
+            return results
 
-            for img_key, img_data in image_index.items():
-                if img_key in used_images:
-                    continue
-                
-                score = 0
-                img_scene_num = img_data.get("scene_number")
-                
-                # Condition 1: Number Match (Primary Condition)
-                is_num_match = False
-                if img_scene_num is not None:
-                    if img_scene_num == seq:
-                        score += 500  # High score for matching number
-                        is_num_match = True
-                    else:
-                        # Heavy penalty for mismatching number to enforce order
-                        score -= 500
-                
-                # Condition 2: Text Match (Secondary Condition)
-                img_norm = img_data.get("normalized", "")
-                is_exact_text = False
-                is_contains_text = False
-                
-                if sub_norm and img_norm:
-                    if sub_norm == img_norm:
-                        score += 100
-                        is_exact_text = True
-                    elif sub_norm in img_norm or img_norm in sub_norm:
-                        overlap = min(len(sub_norm), len(img_norm))
-                        score += overlap
-                        is_contains_text = True
-                
-                if score > best_score and score > 0:
-                    best_score = score
-                    best_match = img_data
-                    best_key = img_key
-                    if is_num_match and is_exact_text:
-                        match_type = "exact_number_and_text"
-                    elif is_num_match:
-                        match_type = "number_match"
-                    elif is_exact_text:
-                        match_type = "exact_text"
-                    elif is_contains_text:
-                        match_type = "contains_text"
-            
-            if best_match:
-                used_images.add(best_key)
-            
-            results.append({
-                "index": sub["index"],
-                "seq": seq,
-                "subtitle": sub,
-                "image": best_match,
-                "status": "matched" if best_match else "unmatched",
-                "match_type": match_type,
-            })
+        else:
+            # --- Mode B: Subtitle-only matching + Gap Filling ---
+            # 1. Initial text matching
+            for i, sub in enumerate(subtitles):
+                seq = i + 1
+                sub_norm = TextMatcher.normalize(sub["text"])
+                scored = []
 
-        return results
+                for img_key, img_data in image_index.items():
+                    if img_key in used_images: continue
+                    img_norm = img_data.get("normalized", "")
+                    img_korean = img_data.get("korean_normalized", "")
+                    target_text = img_korean if img_korean else img_norm
+                    
+                    score = 0
+                    if sub_norm and target_text:
+                        if sub_norm == target_text:
+                            score = 1000
+                        elif sub_norm in target_text or target_text in sub_norm:
+                            score = 100 + min(len(sub_norm), len(target_text)) * 10
+                    
+                    if score > 0:
+                        scored.append((score, img_key, img_data))
+
+                scored.sort(key=lambda x: x[0], reverse=True)
+                matched_images = []
+                best_match_type = "none"
+                if scored:
+                    best_score = scored[0][0]
+                    best_match_type = "exact_text" if best_score >= 1000 else "contains_text"
+                    for sc, key, data in scored:
+                        if sc >= best_score - 50:
+                            matched_images.append(data)
+                            used_images.add(key)
+                        else: break
+
+                results.append({
+                    "index": sub["index"],
+                    "seq": seq,
+                    "subtitle": sub,
+                    "image": matched_images[0] if matched_images else None,
+                    "images": matched_images,
+                    "status": "matched" if matched_images else "unmatched",
+                    "match_type": best_match_type,
+                })
+
+            # 2. Gap Filling (Type B only): 배치되지 않은 항목 앞뒤를 확인하여 채우기
+            for i in range(len(results)):
+                if results[i]["status"] == "unmatched":
+                    # 이전/다음 매칭된 결과 찾기
+                    prev_match = None
+                    for pi in range(i - 1, -1, -1):
+                        if results[pi]["status"] == "matched":
+                            prev_match = results[pi]["image"]
+                            break
+                    
+                    next_match = None
+                    for ni in range(i + 1, len(results)):
+                        if results[ni]["status"] == "matched":
+                            next_match = results[ni]["image"]
+                            break
+                    
+                    # 주변에 매칭된 이미지가 있다면 가장 가까운 것을 사용 (보통 이전 것 유지)
+                    filler = prev_match or next_match
+                    if filler:
+                        results[i]["image"] = filler
+                        results[i]["images"] = [filler]
+                        results[i]["status"] = "matched"
+                        results[i]["match_type"] = "gap_filled"
+
+            return results
 
 
 class DraftGenerator:
@@ -361,19 +424,33 @@ class DraftGenerator:
         data = copy.deepcopy(draft_data)
 
         # Find template material from existing videos
-        template = DraftGenerator._find_template_material(data)
-        if not template:
+        template_mat = DraftGenerator._find_template_material(data)
+        if not template_mat:
             raise ValueError("No template image found in materials.videos. "
                              "CapCut project must contain at least one image.")
+        
+        # Find template segment for robust structure
+        template_seg = DraftGenerator._find_template_segment(data)
 
-        # Register matched images as materials
+        # Register ALL matched images as materials (1:N support)
         new_materials = []
         for result in match_results:
-            if result["status"] in ("matched", "manual") and result["image"]:
+            images = result.get("images", [])
+            if result["status"] not in ("matched", "manual"):
+                if result.get("image"):
+                    images = [result["image"]]
+                else:
+                    continue
+            if not images:
+                continue
+
+            mat_ids = []
+            for img in images:
                 mat = DraftGenerator._create_material(
-                    template, result["image"]["path"], result["image"]["filename"])
+                    template_mat, img["path"], img["filename"])
                 new_materials.append(mat)
-                result["_material_id"] = mat["id"]
+                mat_ids.append(mat["id"])
+            result["_material_ids"] = mat_ids
 
         # Add to materials.videos
         if "materials" not in data:
@@ -382,36 +459,45 @@ class DraftGenerator:
             data["materials"]["videos"] = []
         data["materials"]["videos"].extend(new_materials)
 
-        # Build video segments
-        new_segments = []
+        # Build video segments per track layer
+        track_layers = {}  # layer_index -> list of segments
         for result in match_results:
-            if "_material_id" not in result:
+            mat_ids = result.get("_material_ids", [])
+            if not mat_ids:
                 continue
-            seg = DraftGenerator._create_segment(
-                result["_material_id"],
-                result["subtitle"]["start"],
-                result["subtitle"]["duration"],
-            )
-            new_segments.append(seg)
+            for layer_idx, mat_id in enumerate(mat_ids):
+                seg = DraftGenerator._create_segment(
+                    mat_id,
+                    result["subtitle"]["start"],
+                    result["subtitle"]["duration"],
+                    template_seg
+                )
+                if layer_idx not in track_layers:
+                    track_layers[layer_idx] = []
+                track_layers[layer_idx].append(seg)
 
-        # Sort by start time
-        new_segments.sort(key=lambda s: s["target_timerange"]["start"])
+        # Process each track layer
+        for layer_idx in sorted(track_layers.keys()):
+            segments = track_layers[layer_idx]
+            segments.sort(key=lambda s: s["target_timerange"]["start"])
+            DraftGenerator._fill_gaps(segments)
 
-        # Fill gaps
-        DraftGenerator._fill_gaps(new_segments)
+            # Find existing video track or create new one
+            video_tracks = [t for t in data.get("tracks", []) if t.get("type") == "video"]
 
-        # Find or create video track
-        video_track = None
-        for track in data.get("tracks", []):
-            if track.get("type") == "video":
-                video_track = track
-                break
+            if layer_idx < len(video_tracks):
+                video_tracks[layer_idx]["segments"] = segments
+            else:
+                new_track = {
+                    "attribute": 0,
+                    "flag": 0,
+                    "frozen": False,
+                    "id": str(uuid.uuid4()).upper(),
+                    "segments": segments,
+                    "type": "video"
+                }
+                data["tracks"].append(new_track)
 
-        if video_track is None:
-            video_track = {"type": "video", "segments": [], "attribute": 0}
-            data["tracks"].insert(0, video_track)
-
-        video_track["segments"] = new_segments
         return data
 
     @staticmethod
@@ -423,19 +509,37 @@ class DraftGenerator:
         return None
 
     @staticmethod
+    def _find_template_segment(data):
+        tracks = data.get("tracks", [])
+        for t in tracks:
+            if t.get("type") == "video" and t.get("segments"):
+                return t["segments"][0]
+        return None
+
+    @staticmethod
     def _create_material(template, image_path, filename):
         mat = copy.deepcopy(template)
         mat["id"] = str(uuid.uuid4()).upper()
         mat["path"] = image_path.replace("/", "\\")
         mat["material_name"] = filename
         mat["category_name"] = "local"
-        mat["type"] = 0
-        mat["width"] = 0
-        mat["height"] = 0
+        mat["type"] = "photo" if ".png" in filename.lower() or ".jpg" in filename.lower() else mat.get("type", 0)
         return mat
 
     @staticmethod
-    def _create_segment(material_id, start, duration):
+    def _create_segment(material_id, start, duration, template=None):
+        if template:
+            seg = copy.deepcopy(template)
+            seg["id"] = str(uuid.uuid4()).upper()
+            seg["material_id"] = material_id
+            seg["source_timerange"] = {"start": 0, "duration": duration}
+            seg["target_timerange"] = {"start": start, "duration": duration}
+            seg["render_timerange"] = {"start": 0, "duration": 0}
+            if "extra_material_refs" not in seg:
+                seg["extra_material_refs"] = []
+            return seg
+        
+        # Fallback if no template found (should not happen in healthy project)
         return {
             "id": str(uuid.uuid4()).upper(),
             "material_id": material_id,
@@ -447,9 +551,14 @@ class DraftGenerator:
             "volume": 1.0,
             "clip": {
                 "scale": {"x": 1.0, "y": 1.0},
+                "rotation": 0.0,
                 "transform": {"x": 0.0, "y": 0.0},
+                "flip": {"vertical": False, "horizontal": False}
             },
-            "common_keyframes": [],
+            "extra_material_refs": [],
+            "render_index": 0,
+            "track_render_index": 0,
+            "source": "segmentsourcenormal"
         }
 
     @staticmethod
@@ -626,7 +735,7 @@ class DropZone(tk.Frame):
 
 
 class MatchingTable(tk.Frame):
-    """Scrollable matching results - Stitch glass panel design"""
+    """Treeview-based matching results - High performance for 1000+ rows"""
 
     def __init__(self, parent, all_images=None, **kwargs):
         super().__init__(parent, bg=COLORS['glass'],
@@ -634,7 +743,8 @@ class MatchingTable(tk.Frame):
                          highlightbackground=COLORS['glass_border'], **kwargs)
         self.match_results = []
         self.all_images = all_images or {}
-        self.row_widgets = []
+        self._filtered_results = []  # currently displayed items (index -> result)
+        self._img_names_cache = ["(unmatched)"]
 
         # Header bar (dark top)
         self.header = tk.Frame(self, bg='#0F172D')
@@ -648,12 +758,19 @@ class MatchingTable(tk.Frame):
             bg='#0F172D', fg=COLORS['text_main'])
         self.summary_label.pack(side=tk.LEFT)
 
-        self.badge_label = tk.Label(
-            header_inner, text="0 MATCHES",
-            font=('Segoe UI', 7, 'bold'),
-            bg=COLORS['slate_800'], fg=COLORS['text_secondary'],
-            padx=6, pady=1)
-        self.badge_label.pack(side=tk.LEFT, padx=(8, 0))
+        self.badge_label = tk.Label(self.header, text="0 MATCHES",
+                                    font=('Segoe UI', 9, 'bold'),
+                                    bg=COLORS['border'], fg=COLORS['text_main'],
+                                    padx=8, pady=2)
+        self.badge_label.pack(side=tk.LEFT, padx=10)
+
+        # Filter: Matched / Unmatched / All
+        self.filter_var = tk.StringVar(value="Matched Only")
+        self.filter_combo = ttk.Combobox(self.header, textvariable=self.filter_var,
+                                         values=["Matched Only", "Unmatched Only", "All"],
+                                         state="readonly", width=15, font=('Segoe UI', 8))
+        self.filter_combo.pack(side=tk.RIGHT, padx=10)
+        self.filter_combo.bind("<<ComboboxSelected>>", self._on_filter_changed)
 
         self.clear_btn = tk.Button(
             header_inner, text="Clear Workspace",
@@ -664,146 +781,245 @@ class MatchingTable(tk.Frame):
             command=self._clear_all)
         self.clear_btn.pack(side=tk.RIGHT)
 
-        # Scrollable area
-        self.canvas = tk.Canvas(self, bg=COLORS['glass'], highlightthickness=0)
-        self.scrollbar = ttk.Scrollbar(self, orient="vertical",
-                                        command=self.canvas.yview)
-        self.scroll_frame = tk.Frame(self.canvas, bg=COLORS['glass'])
+        # --- Treeview (high-performance native widget) ---
+        style = ttk.Style()
+        style.configure("Match.Treeview",
+                         background=COLORS['bg'],
+                         foreground=COLORS['text_main'],
+                         fieldbackground=COLORS['bg'],
+                         font=('Segoe UI', 11),
+                         rowheight=32)
+        style.configure("Match.Treeview.Heading",
+                         background=COLORS['border'],
+                         foreground=COLORS['text_secondary'],
+                         font=('Segoe UI', 11, 'bold'))
+        style.map("Match.Treeview",
+                   background=[('selected', COLORS['primary'])],
+                   foreground=[('selected', '#FFFFFF')])
 
-        self.scroll_frame.bind('<Configure>',
-                                lambda e: self.canvas.configure(
-                                    scrollregion=self.canvas.bbox("all")))
-        self.canvas.create_window((0, 0), window=self.scroll_frame,
-                                   anchor="nw")
-        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        tree_frame = tk.Frame(self, bg=COLORS['bg'])
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=(4, 4))
 
-        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8)
-        self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree = ttk.Treeview(tree_frame, style="Match.Treeview",
+                                  columns=("idx", "subtitle", "image", "status"),
+                                  show="headings", selectmode="browse")
 
-        # Mouse wheel scrolling
-        self.canvas.bind('<Enter>',
-                          lambda _: self.canvas.bind_all('<MouseWheel>', self._on_mousewheel))
-        self.canvas.bind('<Leave>',
-                          lambda _: self.canvas.unbind_all('<MouseWheel>'))
+        self.tree.heading("idx", text="#", anchor=tk.W)
+        self.tree.heading("subtitle", text="Subtitle", anchor=tk.W)
+        self.tree.heading("image", text="Image", anchor=tk.W)
+        self.tree.heading("status", text="Status", anchor=tk.CENTER)
 
-    def _on_mousewheel(self, event):
-        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        self.tree.column("idx", width=50, minwidth=40, stretch=False)
+        self.tree.column("subtitle", width=350, minwidth=200, stretch=True)
+        self.tree.column("image", width=400, minwidth=200, stretch=True)
+        self.tree.column("status", width=70, minwidth=50, stretch=False)
 
-    def update_results(self, results, all_images=None):
+        # Tag-based coloring (much faster than per-widget)
+        self.tree.tag_configure("matched",
+                                 foreground=COLORS['success'])
+        self.tree.tag_configure("unmatched",
+                                 foreground=COLORS['error'])
+
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Double-click to manually assign image (unmatched rows)
+        self.tree.bind("<Double-1>", self._on_double_click)
+
+        # Status bar for empty / info
+        self.status_frame = tk.Frame(self, bg=COLORS['bg'])
+        self.status_msg = tk.Label(self.status_frame, text="",
+                                    font=('Segoe UI', 11),
+                                    bg=COLORS['bg'], fg=COLORS['text_secondary'])
+        self.status_msg.pack(pady=10)
+
+    def _on_filter_changed(self, event=None):
+        if hasattr(self, 'match_results') and self.match_results:
+            self.update_results(self.match_results, filter_state=self.filter_var.get())
+
+    def update_results(self, results, all_images=None, filter_state=None):
         self.match_results = results
+        if filter_state is not None:
+            self.filter_var.set(filter_state)
+
+        current_filter = self.filter_var.get()
         if all_images:
             self.all_images = all_images
-
-        # Clear existing rows
-        for widget in self.scroll_frame.winfo_children():
-            widget.destroy()
-        self.row_widgets = []
-
-        matched = sum(1 for r in results if r["status"] in ("matched", "manual"))
-        total = len(results)
-
-        # Update badge
-        self.badge_label.config(text=f"{matched} MATCHES")
-
-        # Column headers
-        hdr = tk.Frame(self.scroll_frame, bg=COLORS['border'])
-        hdr.pack(fill=tk.X, pady=(0, 2))
-        tk.Label(hdr, text="#", width=4, font=('Segoe UI', 8, 'bold'),
-                 bg=COLORS['border'], fg=COLORS['text_secondary'],
-                 anchor=tk.W).pack(side=tk.LEFT)
-        tk.Label(hdr, text="Subtitle", width=25, font=('Segoe UI', 8, 'bold'),
-                 bg=COLORS['border'], fg=COLORS['text_secondary'],
-                 anchor=tk.W).pack(side=tk.LEFT)
-        tk.Label(hdr, text="Image", width=25, font=('Segoe UI', 8, 'bold'),
-                 bg=COLORS['border'], fg=COLORS['text_secondary'],
-                 anchor=tk.W).pack(side=tk.LEFT)
-        tk.Label(hdr, text="Status", width=6, font=('Segoe UI', 8, 'bold'),
-                 bg=COLORS['border'], fg=COLORS['text_secondary'],
-                 anchor=tk.CENTER).pack(side=tk.LEFT)
-
-        # Data rows
-        for r in results:
-            self._add_row(r)
-
-    def _add_row(self, result):
-        is_matched = result["status"] in ("matched", "manual")
-        row_bg = COLORS['glass']
-        row = tk.Frame(self.scroll_frame, bg=row_bg)
-        row.pack(fill=tk.X, pady=1)
-
-        idx_text = str(result["index"] + 1)
-        sub_text = result["subtitle"]["text"]
-        if len(sub_text) > 22:
-            sub_text = sub_text[:19] + "..."
-
-        img_text = result["image"]["filename"] if result["image"] else "(unmatched)"
-        if len(img_text) > 22:
-            img_text = img_text[:19] + "..."
-
-        status_text = "O" if is_matched else "X"
-        status_color = COLORS['success'] if is_matched else COLORS['error']
-
-        tk.Label(row, text=idx_text, width=4, font=('Segoe UI', 9),
-                 bg=row_bg, fg=COLORS['text_secondary'],
-                 anchor=tk.W).pack(side=tk.LEFT)
-        tk.Label(row, text=sub_text, width=25, font=('Segoe UI', 9),
-                 bg=row_bg, fg=COLORS['text_main'],
-                 anchor=tk.W).pack(side=tk.LEFT)
-
-        if is_matched:
-            tk.Label(row, text=img_text, width=25, font=('Segoe UI', 9),
-                     bg=row_bg, fg=COLORS['text_main'],
-                     anchor=tk.W).pack(side=tk.LEFT)
-        else:
-            # Combobox for manual assignment
-            img_names = ["(unmatched)"] + [
-                v["filename"] for v in self.all_images.values()
+            self._img_names_cache = ["(unmatched)"] + [
+                v["filename"] for v in all_images.values()
             ]
-            combo_var = tk.StringVar(value="(unmatched)")
-            combo = ttk.Combobox(row, textvariable=combo_var,
-                                  values=img_names, width=22,
-                                  state="readonly")
-            combo.pack(side=tk.LEFT)
 
-            def on_select(event, res=result, var=combo_var):
-                sel = var.get()
-                if sel != "(unmatched)":
-                    for img_data in self.all_images.values():
-                        if img_data["filename"] == sel:
-                            res["image"] = img_data
-                            res["status"] = "manual"
-                            res["match_type"] = "manual"
-                            break
-                    self._refresh_summary()
-                else:
-                    res["image"] = None
-                    res["status"] = "unmatched"
-                    res["match_type"] = "none"
-                    self._refresh_summary()
+        # Filter
+        if current_filter == "Matched Only":
+            self._filtered_results = [r for r in results if r["status"] in ("matched", "manual")]
+        elif current_filter == "Unmatched Only":
+            self._filtered_results = [r for r in results if r["status"] not in ("matched", "manual")]
+        else:
+            self._filtered_results = results[:]
 
-            combo.bind("<<ComboboxSelected>>", on_select)
+        # Stats
+        matched = sum(1 for r in results if r["status"] in ("matched", "manual"))
+        unmatched_count = len(results) - matched
 
-        tk.Label(row, text=status_text, width=6, font=('Segoe UI', 9, 'bold'),
-                 bg=row_bg, fg=status_color,
-                 anchor=tk.CENTER).pack(side=tk.LEFT)
+        status_text = f"{matched} MATCHED | {unmatched_count} UNMATCHED"
+        if current_filter != "All":
+            status_text += f" (Showing {current_filter})"
+        self.badge_label.config(text=status_text)
 
-        self.row_widgets.append(row)
+        # Clear treeview
+        self.tree.delete(*self.tree.get_children())
+        self.status_frame.pack_forget()
+
+        if not self._filtered_results:
+            if unmatched_count == 0 and current_filter != "Unmatched Only":
+                self.status_msg.config(text="✨ All items matched perfectly!",
+                                        fg=COLORS['success'])
+            else:
+                self.status_msg.config(text=f"No results for: {current_filter}",
+                                        fg=COLORS['text_secondary'])
+            self.status_frame.pack(fill=tk.X, pady=20)
+            return
+
+        # Insert ALL rows instantly (Treeview handles virtualization natively)
+        for r in self._filtered_results:
+            is_matched = r["status"] in ("matched", "manual")
+            idx_text = str(r["index"] + 1)
+            sub_text = r["subtitle"]["text"]
+
+            images = r.get("images", [])
+            if not images and r.get("image"):
+                images = [r["image"]]
+            if images:
+                first_name = images[0]["filename"]
+                img_text = f"{first_name} (+{len(images)-1})" if len(images) > 1 else first_name
+            else:
+                img_text = "(unmatched)"
+
+            status_text = "OK" if is_matched else "NEED"
+            tag = "matched" if is_matched else "unmatched"
+
+            self.tree.insert("", tk.END,
+                              values=(idx_text, sub_text, img_text, status_text),
+                              tags=(tag,))
+
+    def _on_double_click(self, event):
+        """Double-click on unmatched row to assign image manually"""
+        item = self.tree.focus()
+        if not item:
+            return
+
+        values = self.tree.item(item, "values")
+        tags = self.tree.item(item, "tags")
+        if "matched" in tags:
+            return  # already matched, ignore
+
+        idx_text = values[0]
+
+        # Find matching result
+        target_result = None
+        for r in self.match_results:
+            if str(r["index"] + 1) == idx_text:
+                target_result = r
+                break
+
+        if not target_result:
+            return
+
+        # Show a selection dialog
+        dialog = tk.Toplevel(self)
+        dialog.title(f"Assign Image to #{idx_text}")
+        dialog.geometry("500x400")
+        dialog.configure(bg=COLORS['bg'])
+        dialog.transient(self.winfo_toplevel())
+        dialog.grab_set()
+
+        tk.Label(dialog, text=f"Subtitle: {target_result['subtitle']['text']}",
+                 font=('Segoe UI', 10, 'bold'),
+                 bg=COLORS['bg'], fg=COLORS['text_main'],
+                 wraplength=480).pack(padx=10, pady=(10, 5), anchor=tk.W)
+
+        tk.Label(dialog, text="Select an image:",
+                 font=('Segoe UI', 9),
+                 bg=COLORS['bg'], fg=COLORS['text_secondary']).pack(padx=10, anchor=tk.W)
+
+        list_frame = tk.Frame(dialog, bg=COLORS['bg'])
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        listbox = tk.Listbox(list_frame, font=('Segoe UI', 10),
+                              bg=COLORS['card'], fg=COLORS['text_main'],
+                              selectbackground=COLORS['primary'],
+                              selectforeground='#FFFFFF',
+                              relief=tk.FLAT)
+
+        lb_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
+        listbox.configure(yscrollcommand=lb_scroll.set)
+
+        listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        lb_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        img_names = [v["filename"] for v in self.all_images.values()]
+        for name in img_names:
+            listbox.insert(tk.END, name)
+
+        def apply_selection():
+            sel = listbox.curselection()
+            if not sel:
+                dialog.destroy()
+                return
+            selected_name = img_names[sel[0]]
+            for img_data in self.all_images.values():
+                if img_data["filename"] == selected_name:
+                    target_result["image"] = img_data
+                    target_result["images"] = [img_data]
+                    target_result["status"] = "manual"
+                    target_result["match_type"] = "manual"
+                    break
+            dialog.destroy()
+            self._refresh_summary()
+            self.update_results(self.match_results, filter_state=self.filter_var.get())
+
+        btn_frame = tk.Frame(dialog, bg=COLORS['bg'])
+        btn_frame.pack(fill=tk.X, padx=10, pady=10)
+        tk.Button(btn_frame, text="Apply", font=('Segoe UI', 10, 'bold'),
+                  bg=COLORS['primary'], fg='#FFFFFF', relief=tk.FLAT,
+                  padx=20, pady=4, cursor='hand2',
+                  command=apply_selection).pack(side=tk.RIGHT, padx=(5, 0))
+        tk.Button(btn_frame, text="Cancel", font=('Segoe UI', 10),
+                  bg=COLORS['card'], fg=COLORS['text_secondary'], relief=tk.FLAT,
+                  padx=20, pady=4, cursor='hand2',
+                  command=dialog.destroy).pack(side=tk.RIGHT)
 
     def _refresh_summary(self):
         matched = sum(1 for r in self.match_results
                       if r["status"] in ("matched", "manual"))
-        self.badge_label.config(text=f"{matched} MATCHES")
+        unmatched = len(self.match_results) - matched
+        self.badge_label.config(text=f"{matched} MATCHED | {unmatched} UNMATCHED")
 
     def get_results(self):
         return self.match_results
 
     def _clear_all(self):
         self.match_results = []
-        for w in self.scroll_frame.winfo_children():
-            w.destroy()
-        self.row_widgets = []
+        self._filtered_results = []
+        self.tree.delete(*self.tree.get_children())
         self.badge_label.config(text="0 MATCHES")
         self._show_empty_state()
+
+    def _show_empty_state(self):
+        """Show Stitch-style empty state"""
+        self.status_msg.config(text="Waiting for data\nConnect your folders to start automated matching",
+                                fg=COLORS['text_muted'])
+        self.status_frame.pack(fill=tk.X, pady=40)
+
+
+# ============================================================
+# 4. Motion UI Widgets (Reused)
+# ============================================================
+# ... (rest of the code)
+
+# Note: Need to update ImageMatchingTab._generate later
 
     def _show_empty_state(self):
         """Show Stitch-style empty state with icon and text"""
@@ -1031,6 +1247,7 @@ class ImageMatchingTab(tk.Frame):
         self.image_index = {}
         self.match_results = []
         self.generated_path = None
+        self.match_mode = tk.StringVar(value="script")  # "script" (Type B) or "srt_index" (Type A)
 
         self._build_ui()
 
@@ -1129,6 +1346,40 @@ class ImageMatchingTab(tk.Frame):
             on_select=self._on_image_folder)
         self.image_drop.pack(fill=tk.BOTH, expand=True, pady=(0, 0))
 
+        # Match Mode selector
+        mode_frame = tk.Frame(left, bg=COLORS['glass'],
+                              highlightthickness=1,
+                              highlightbackground=COLORS['glass_border'])
+        mode_frame.pack(fill=tk.X, pady=(8, 0))
+        mode_inner = tk.Frame(mode_frame, bg=COLORS['glass'])
+        mode_inner.pack(fill=tk.X, padx=10, pady=8)
+
+        tk.Label(mode_inner, text="MATCH MODE",
+                 font=('Segoe UI', 7, 'bold'),
+                 bg=COLORS['glass'], fg=COLORS['text_muted']).pack(anchor=tk.W)
+
+        rb_a = tk.Radiobutton(
+            mode_inner, text="유형 A: SRT 인덱스 매칭",
+            variable=self.match_mode, value="srt_index",
+            font=('Segoe UI', 9),
+            bg=COLORS['glass'], fg=COLORS['text_main'],
+            selectcolor=COLORS['card'],
+            activebackground=COLORS['glass'],
+            activeforeground=COLORS['primary_light'],
+            command=self._try_match)
+        rb_a.pack(anchor=tk.W, pady=(4, 0))
+
+        rb_b = tk.Radiobutton(
+            mode_inner, text="유형 B: 대본 텍스트 매칭",
+            variable=self.match_mode, value="script",
+            font=('Segoe UI', 9),
+            bg=COLORS['glass'], fg=COLORS['text_main'],
+            selectcolor=COLORS['card'],
+            activebackground=COLORS['glass'],
+            activeforeground=COLORS['primary_light'],
+            command=self._try_match)
+        rb_b.pack(anchor=tk.W, pady=(2, 0))
+
         # Right section (flex-1): matching results glass panel
         right = tk.Frame(main, bg=COLORS['bg'])
         right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(8, 0))
@@ -1143,99 +1394,136 @@ class ImageMatchingTab(tk.Frame):
         self.status_label.pack(anchor=tk.W, pady=(4, 0))
 
     def _on_project_folder(self, path):
-        draft_file = os.path.join(path, "draft_content.json")
-        if not os.path.isfile(draft_file):
-            messagebox.showerror("Error",
-                                 "draft_content.json not found in this folder.")
-            self.project_drop._reset()
-            return
+        # Immediate UI feedback
+        self.status_label.config(text="Loading project...", fg=COLORS['primary'])
+        self.update()
 
-        try:
-            with open(draft_file, "r", encoding="utf-8") as f:
-                self.draft_data = json.load(f)
-            self.draft_path = draft_file
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to load draft:\n{e}")
-            self.project_drop._reset()
-            return
+        def _do_load():
+            draft_file = os.path.join(path, "draft_content.json")
+            if not os.path.isfile(draft_file):
+                messagebox.showerror("Error",
+                                     "draft_content.json not found in this folder.")
+                self.project_drop._reset()
+                return
 
-        self.subtitles = SubtitleExtractor.extract(self.draft_data)
-        if not self.subtitles:
-            messagebox.showwarning("Warning", "No subtitles found in project.")
+            try:
+                with open(draft_file, "r", encoding="utf-8") as f:
+                    self.draft_data = json.load(f)
+                self.draft_path = draft_file
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to load draft:\n{e}")
+                self.project_drop._reset()
+                return
 
-        self.status_label.config(
-            text=f"Found {len(self.subtitles)} subtitles",
-            fg=COLORS['success'])
-        self._try_match()
+            self.subtitles = SubtitleExtractor.extract(self.draft_data)
+            if not self.subtitles:
+                messagebox.showwarning("Warning", "No subtitles found in project.")
+
+            self.status_label.config(
+                text=f"Found {len(self.subtitles)} subtitles",
+                fg=COLORS['success'])
+            self._try_match()
+
+        # Small delay to ensure UI updates
+        self.after(100, _do_load)
 
     def _on_image_folder(self, path):
-        self.image_folder = path
-        self.image_index = ImageIndexer.index(path)
-        count = len(self.image_index)
-        self.status_label.config(
-            text=f"Found {count} images",
-            fg=COLORS['success'] if count > 0 else COLORS['warning'])
-        self._try_match()
+        self.status_label.config(text="Indexing images...", fg=COLORS['primary'])
+        self.update()
+
+        def _do_index():
+            self.image_folder = path
+            self.image_index = ImageIndexer.index(path)
+            count = len(self.image_index)
+            self.status_label.config(
+                text=f"Found {count} images",
+                fg=COLORS['success'] if count > 0 else COLORS['warning'])
+            self._try_match()
+
+        self.after(100, _do_index)
 
     def _try_match(self):
         if not self.subtitles or not self.image_index:
             return
 
-        self.match_results = TextMatcher.match(self.subtitles, self.image_index)
-        self.matching_table.update_results(self.match_results, self.image_index)
-        self.generate_btn.config(state=tk.NORMAL)
+        # Show busy state
+        self.status_label.config(text="Matching...", fg=COLORS['warning'])
+        self.update()
 
-        matched = sum(1 for r in self.match_results
-                      if r["status"] in ("matched", "manual"))
-        self.status_label.config(
-            text=f"{matched}/{len(self.match_results)} subtitles matched",
-            fg=COLORS['success'] if matched == len(self.match_results)
-            else COLORS['warning'])
+        try:
+            self.match_results = TextMatcher.match(self.subtitles, self.image_index, self.match_mode.get())
+            self.matching_table.update_results(self.match_results, self.image_index)
+            self.generate_btn.config(state=tk.NORMAL)
+
+            matched = sum(1 for r in self.match_results
+                          if r["status"] in ("matched", "manual"))
+            self.status_label.config(
+                text=f"{matched}/{len(self.match_results)} subtitles matched",
+                fg=COLORS['success'] if matched == len(self.match_results)
+                else COLORS['warning'])
+        except Exception as e:
+            print(f"Matching error: {e}")
+            messagebox.showerror("Error", f"Error during matching: {e}")
 
     def _generate(self):
         if not self.draft_data or not self.match_results:
             messagebox.showerror("Error", "Please load both folders first.")
             return
 
-        try:
-            self.status_label.config(text="Generating...", fg=COLORS['warning'])
-            self.update()
+        # UI Feedback: Disable button and show spinner-like text
+        self.generate_btn.config(state=tk.DISABLED, text="⌛ Generating...")
+        self.status_label.config(text="Generating project... Please wait.", fg=COLORS['primary'])
+        self.update()
 
-            # Get latest results (includes manual overrides)
-            results = self.matching_table.get_results()
+        def _do_generate():
+            try:
+                # Get latest results (includes manual overrides)
+                results = self.matching_table.get_results()
 
-            # Backup
-            backup_path = self.draft_path + ".bak"
-            with open(self.draft_path, "r", encoding="utf-8") as f:
-                original = f.read()
-            with open(backup_path, "w", encoding="utf-8") as f:
-                f.write(original)
+                # Backup
+                backup_path = self.draft_path + ".bak"
+                with open(self.draft_path, "r", encoding="utf-8") as f:
+                    original = f.read()
+                with open(backup_path, "w", encoding="utf-8") as f:
+                    f.write(original)
 
-            # Generate
-            modified = DraftGenerator.generate(
-                self.draft_data, results, self.image_folder)
+                # Generate
+                modified = DraftGenerator.generate(
+                    self.draft_data, results, self.image_folder)
 
-            # Save
-            output_path = self.draft_path
-            with open(output_path, "w", encoding="utf-8") as f:
-                json.dump(modified, f, ensure_ascii=False, indent=2)
+                # Save
+                output_path = self.draft_path
+                with open(output_path, "w", encoding="utf-8") as f:
+                    json.dump(modified, f, ensure_ascii=False, indent=2)
 
-            self.generated_path = output_path
-            self.chain_btn.config(state=tk.NORMAL)
+                self.generated_path = output_path
+                
+                # Success UI
+                self.chain_btn.config(state=tk.NORMAL)
+                matched = sum(1 for r in results
+                              if r["status"] in ("matched", "manual"))
+                self.status_label.config(
+                    text=f"Generated! {matched} images placed.",
+                    fg=COLORS['success'])
+                
+                messagebox.showinfo("Success",
+                                    f"Project generated successfully!\n"
+                                    f"{matched} images placed on timeline.")
 
-            matched = sum(1 for r in results
-                          if r["status"] in ("matched", "manual"))
-            self.status_label.config(
-                text=f"Generated! {matched} images placed. Backup saved as .bak",
-                fg=COLORS['success'])
-            messagebox.showinfo("Success",
-                                f"Project generated successfully!\n"
-                                f"{matched} images placed on timeline.\n"
-                                f"Backup: {os.path.basename(backup_path)}")
+            except Exception as e:
+                self.status_label.config(text=f"Error: {e}", fg=COLORS['error'])
+                messagebox.showerror("Error", str(e))
+            finally:
+                # Restore button state
+                self.generate_btn.config(state=tk.NORMAL, text="GENERATE PROJECT")
 
-        except Exception as e:
-            self.status_label.config(text=f"Error: {e}", fg=COLORS['error'])
-            messagebox.showerror("Error", str(e))
+        # Run generate in a slight delay to allow UI to update
+        self.after(100, _do_generate)
+
+    def _on_show_all_toggle(self):
+        show_all = getattr(self, '_show_all_results', False)
+        self._show_all_results = not show_all
+        self.matching_table.update_results(self.match_results, self.image_index, show_all=self._show_all_results)
 
     def _chain_to_motion(self):
         if self.generated_path and self.on_chain_to_motion:
@@ -1424,18 +1712,19 @@ class MotionTab(tk.Frame):
         self.pan_v_var.trace_add('write', lambda *_: self._schedule_preview())
 
     def _build_settings_section(self, parent):
-        inner = self._section(parent, "Settings")
+        inner = self._section(parent, "Settings (설정)")
+        # Labels and variables for scale are now in % (104 means 1.04)
         rows = [
-            ("Start Scale", "start_scale", 1.04, None, None),
-            ("End Scale", "end_scale_min", 1.08, "end_scale_max", 1.10),
-            ("Pan Strength", "pan_strength", 0.05, None, None),
+            ("시작 스케일 (%)", "start_scale", 104.0, None, None),
+            ("종료 스케일 (%)", "end_scale_min", 130.0, "end_scale_max", 140.0),
+            ("이동 강도 (Pan)", "pan_strength", 0.05, None, None),
         ]
         for i, (label, v1n, v1v, v2n, v2v) in enumerate(rows):
             row = tk.Frame(inner, bg=COLORS['card'])
             row.pack(fill=tk.X, pady=(4 if i == 0 else 0, 4))
             tk.Label(row, text=label, font=('Segoe UI', 10),
                      bg=COLORS['card'], fg=COLORS['text_main'],
-                     width=14, anchor=tk.W).pack(side=tk.LEFT)
+                     width=16, anchor=tk.W).pack(side=tk.LEFT)
             v1 = tk.DoubleVar(value=v1v)
             setattr(self, v1n, v1)
             self._entry(row, v1).pack(side=tk.LEFT)
@@ -1452,7 +1741,7 @@ class MotionTab(tk.Frame):
                          fg=COLORS['text_secondary']).pack(side=tk.LEFT)
 
     def _build_preview_section(self, parent):
-        inner = self._section(parent, "Motion Preview", width=355)
+        inner = self._section(parent, "Motion Preview (프리뷰)", width=355)
         inner.master.pack(fill=tk.BOTH, expand=True)
 
         self.preview = AnimatedPreview(inner, width=330, height=200)
@@ -1493,19 +1782,17 @@ class MotionTab(tk.Frame):
                                 bg=COLORS['bg_motion'], fg=COLORS['primary'],
                                 width=12, anchor=tk.W)
             lbl_attr.grid(row=i+1, column=0, sticky=tk.W)
-            lbl_start = tk.Label(self.info_grid, text="0.0000",
+            lbl_start = tk.Label(self.info_grid, text="0.00",
                                  font=('Consolas', 9),
                                  bg=COLORS['bg_motion'], fg=COLORS['text_main'],
                                  width=12, anchor=tk.W)
             lbl_start.grid(row=i+1, column=1, sticky=tk.W)
-            lbl_end = tk.Label(self.info_grid, text="0.0000",
+            lbl_end = tk.Label(self.info_grid, text="0.00",
                                font=('Consolas', 9),
                                bg=COLORS['bg_motion'], fg=COLORS['accent_cyan'],
                                width=12, anchor=tk.W)
             lbl_end.grid(row=i+1, column=2, sticky=tk.W)
             self.info_rows[attr] = (lbl_start, lbl_end)
-
-        self._update_preview()
 
     def _schedule_preview(self):
         if self.update_timer:
@@ -1514,9 +1801,10 @@ class MotionTab(tk.Frame):
 
     def _update_preview(self):
         try:
-            ss = self.start_scale.get()
-            emin = self.end_scale_min.get()
-            emax = self.end_scale_max.get()
+            # Convert UI % to Engine Scale (104 -> 1.04)
+            ss = self.start_scale.get() / 100.0
+            emin = self.end_scale_min.get() / 100.0
+            emax = self.end_scale_max.get() / 100.0
             ps = self.pan_strength.get()
 
             start_s, end_s = MotionEngine.compute_zoom(
@@ -1542,12 +1830,12 @@ class MotionTab(tk.Frame):
                      f"V: {pan_labels.get(self.pan_v_var.get(), '?')}")
 
             # Update grid values (End in cyan)
-            self.info_rows["Scale"][0].config(text=f"{start_s:.4f}")
-            self.info_rows["Scale"][1].config(text=f"{end_s:.4f}")
-            self.info_rows["Pan X"][0].config(text=f"{start_x:+.4f}")
-            self.info_rows["Pan X"][1].config(text=f"{end_x:+.4f}")
-            self.info_rows["Pan Y"][0].config(text=f"{start_y:+.4f}")
-            self.info_rows["Pan Y"][1].config(text=f"{end_y:+.4f}")
+            self.info_rows["Scale"][0].config(text=f"{start_s:.2f}")
+            self.info_rows["Scale"][1].config(text=f"{end_s:.2f}")
+            self.info_rows["Pan X"][0].config(text=f"{start_x:+.2f}")
+            self.info_rows["Pan X"][1].config(text=f"{end_x:+.2f}")
+            self.info_rows["Pan Y"][0].config(text=f"{start_y:+.2f}")
+            self.info_rows["Pan Y"][1].config(text=f"{end_y:+.2f}")
         except (tk.TclError, ValueError):
             pass
 
@@ -1654,9 +1942,11 @@ class MotionTab(tk.Frame):
         zt = self.zoom_var.get()
         ph = self.pan_h_var.get()
         pv = self.pan_v_var.get()
-        ss = self.start_scale.get()
-        emin = self.end_scale_min.get()
-        emax = self.end_scale_max.get()
+        
+        # Convert UI % to Engine Scale (104 -> 1.04)
+        ss = self.start_scale.get() / 100.0
+        emin = self.end_scale_min.get() / 100.0
+        emax = self.end_scale_max.get() / 100.0
         ps = self.pan_strength.get()
 
         for track in data.get("tracks", []):
