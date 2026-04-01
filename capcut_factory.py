@@ -10,6 +10,7 @@ import os
 import sys
 import re
 import copy
+import shutil
 import unicodedata
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -432,8 +433,11 @@ class DraftGenerator:
         # Find template segment for robust structure
         template_seg = DraftGenerator._find_template_segment(data)
 
-        # Register ALL matched images as materials (1:N support)
+        # Register matched images as materials.
+        # Reuse material ids for identical file paths so consecutive same-image
+        # segments can be merged cleanly later.
         new_materials = []
+        material_id_cache = {}
         for result in match_results:
             images = result.get("images", [])
             if result["status"] not in ("matched", "manual"):
@@ -446,10 +450,15 @@ class DraftGenerator:
 
             mat_ids = []
             for img in images:
-                mat = DraftGenerator._create_material(
-                    template_mat, img["path"], img["filename"])
-                new_materials.append(mat)
-                mat_ids.append(mat["id"])
+                mat_key = os.path.normcase(os.path.normpath(img["path"]))
+                mat_id = material_id_cache.get(mat_key)
+                if mat_id is None:
+                    mat = DraftGenerator._create_material(
+                        template_mat, img["path"], img["filename"])
+                    new_materials.append(mat)
+                    mat_id = mat["id"]
+                    material_id_cache[mat_key] = mat_id
+                mat_ids.append(mat_id)
             result["_material_ids"] = mat_ids
 
         # Add to materials.videos
@@ -481,6 +490,7 @@ class DraftGenerator:
             segments = track_layers[layer_idx]
             segments.sort(key=lambda s: s["target_timerange"]["start"])
             DraftGenerator._fill_gaps(segments)
+            segments = DraftGenerator._merge_adjacent_same_material(segments)
 
             # Find existing video track or create new one
             video_tracks = [t for t in data.get("tracks", []) if t.get("type") == "video"]
@@ -570,6 +580,29 @@ class DraftGenerator:
             if gap > 0:
                 current["duration"] += gap
                 segments[i]["source_timerange"]["duration"] = current["duration"]
+
+    @staticmethod
+    def _merge_adjacent_same_material(segments):
+        """Merge touching segments that reference the same material."""
+        if not segments:
+            return segments
+
+        merged = [segments[0]]
+        for seg in segments[1:]:
+            prev = merged[-1]
+            prev_t = prev["target_timerange"]
+            seg_t = seg["target_timerange"]
+            prev_end = prev_t["start"] + prev_t["duration"]
+            is_touching = prev_end == seg_t["start"]
+
+            if prev.get("material_id") == seg.get("material_id") and is_touching:
+                prev_t["duration"] += seg_t["duration"]
+                if "source_timerange" in prev and "source_timerange" in seg:
+                    prev["source_timerange"]["duration"] += seg["source_timerange"]["duration"]
+            else:
+                merged.append(seg)
+
+        return merged
 
 
 # ============================================================
@@ -1242,12 +1275,14 @@ class ImageMatchingTab(tk.Frame):
         self.on_chain_to_motion = on_chain_to_motion
         self.draft_data = None
         self.draft_path = None
+        self.draft_files = []
+        self.draft_data_map = {}
         self.image_folder = None
         self.subtitles = []
         self.image_index = {}
         self.match_results = []
         self.generated_path = None
-        self.match_mode = tk.StringVar(value="script")  # "script" (Type B) or "srt_index" (Type A)
+        self.match_mode = tk.StringVar(value="srt_index")  # "script" (Type B) or "srt_index" (Type A)
 
         self._build_ui()
 
@@ -1399,33 +1434,68 @@ class ImageMatchingTab(tk.Frame):
         self.update()
 
         def _do_load():
-            draft_file = os.path.join(path, "draft_content.json")
-            if not os.path.isfile(draft_file):
+            draft_files = self._find_draft_files(path)
+            if not draft_files:
                 messagebox.showerror("Error",
-                                     "draft_content.json not found in this folder.")
+                                     "No draft_content.json files found in this folder.")
                 self.project_drop._reset()
                 return
 
             try:
-                with open(draft_file, "r", encoding="utf-8") as f:
-                    self.draft_data = json.load(f)
-                self.draft_path = draft_file
+                loaded = {}
+                for draft_file in draft_files:
+                    with open(draft_file, "r", encoding="utf-8") as f:
+                        loaded[draft_file] = json.load(f)
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to load draft:\n{e}")
                 self.project_drop._reset()
                 return
 
-            self.subtitles = SubtitleExtractor.extract(self.draft_data)
+            # Choose primary draft for subtitle extraction:
+            # prefer the first file that actually has subtitles.
+            primary_path = draft_files[0]
+            primary_subtitles = []
+            for p in draft_files:
+                subs = SubtitleExtractor.extract(loaded[p])
+                if subs:
+                    primary_path = p
+                    primary_subtitles = subs
+                    break
+            if not primary_subtitles:
+                primary_subtitles = SubtitleExtractor.extract(loaded[primary_path])
+
+            self.draft_files = draft_files
+            self.draft_data_map = loaded
+            self.draft_path = primary_path
+            self.draft_data = loaded[primary_path]
+            self.subtitles = primary_subtitles
+
             if not self.subtitles:
                 messagebox.showwarning("Warning", "No subtitles found in project.")
 
             self.status_label.config(
-                text=f"Found {len(self.subtitles)} subtitles",
+                text=f"Found {len(self.subtitles)} subtitles | {len(self.draft_files)} draft file(s)",
                 fg=COLORS['success'])
             self._try_match()
 
         # Small delay to ensure UI updates
         self.after(100, _do_load)
+
+    def _find_draft_files(self, project_folder):
+        drafts = []
+        project_norm = os.path.normcase(os.path.normpath(project_folder))
+        for root, _, files in os.walk(project_folder):
+            if "draft_content.json" in files:
+                drafts.append(os.path.join(root, "draft_content.json"))
+
+        def sort_key(p):
+            parent_norm = os.path.normcase(os.path.normpath(os.path.dirname(p)))
+            is_root = 0 if parent_norm == project_norm else 1
+            depth = p.count(os.sep)
+            return (is_root, depth, p.lower())
+
+        drafts.sort(key=sort_key)
+        return drafts
 
     def _on_image_folder(self, path):
         self.status_label.config(text="Indexing images...", fg=COLORS['primary'])
@@ -1466,7 +1536,7 @@ class ImageMatchingTab(tk.Frame):
             messagebox.showerror("Error", f"Error during matching: {e}")
 
     def _generate(self):
-        if not self.draft_data or not self.match_results:
+        if not self.draft_files or not self.match_results:
             messagebox.showerror("Error", "Please load both folders first.")
             return
 
@@ -1479,36 +1549,54 @@ class ImageMatchingTab(tk.Frame):
             try:
                 # Get latest results (includes manual overrides)
                 results = self.matching_table.get_results()
+                generated_outputs = []
 
-                # Backup
-                backup_path = self.draft_path + ".bak"
-                with open(self.draft_path, "r", encoding="utf-8") as f:
-                    original = f.read()
-                with open(backup_path, "w", encoding="utf-8") as f:
-                    f.write(original)
+                # 0) Clear CapCut caches before writing drafts
+                cache_deleted, cache_failed, cache_dirs, cache_skipped = self._clear_capcut_cache()
 
-                # Generate
-                modified = DraftGenerator.generate(
-                    self.draft_data, results, self.image_folder)
+                # 1) Build output payloads in-memory first.
+                for draft_path in self.draft_files:
+                    src = self.draft_data_map.get(draft_path)
+                    if src is None:
+                        with open(draft_path, "r", encoding="utf-8") as f:
+                            src = json.load(f)
+                    try:
+                        modified = DraftGenerator.generate(src, results, self.image_folder)
+                    except Exception as gen_err:
+                        raise RuntimeError(f"Failed to generate: {draft_path}\n{gen_err}") from gen_err
+                    generated_outputs.append((draft_path, modified))
 
-                # Save
-                output_path = self.draft_path
-                with open(output_path, "w", encoding="utf-8") as f:
-                    json.dump(modified, f, ensure_ascii=False, indent=2)
+                # 2) Backup and save all files.
+                for draft_path, modified in generated_outputs:
+                    backup_path = draft_path + ".bak"
+                    with open(draft_path, "r", encoding="utf-8") as f:
+                        original = f.read()
+                    with open(backup_path, "w", encoding="utf-8") as f:
+                        f.write(original)
+                    with open(draft_path, "w", encoding="utf-8") as f:
+                        json.dump(modified, f, ensure_ascii=False, indent=2)
+                    self.draft_data_map[draft_path] = modified
 
-                self.generated_path = output_path
+                self.generated_path = self.draft_path
                 
                 # Success UI
                 self.chain_btn.config(state=tk.NORMAL)
                 matched = sum(1 for r in results
                               if r["status"] in ("matched", "manual"))
                 self.status_label.config(
-                    text=f"Generated! {matched} images placed.",
+                    text=f"Generated! {matched} images placed | {len(generated_outputs)} draft file(s) updated.",
                     fg=COLORS['success'])
                 
+                cache_text = (
+                    "Cache clean skipped (CapCut is running)."
+                    if cache_skipped
+                    else f"Cache cleaned: {cache_deleted} deleted / {cache_failed} failed (in {cache_dirs} folder(s))."
+                )
                 messagebox.showinfo("Success",
                                     f"Project generated successfully!\n"
-                                    f"{matched} images placed on timeline.")
+                                    f"{matched} images placed on timeline.\n"
+                                    f"Updated draft files: {len(generated_outputs)}\n"
+                                    f"{cache_text}")
 
             except Exception as e:
                 self.status_label.config(text=f"Error: {e}", fg=COLORS['error'])
@@ -1520,18 +1608,63 @@ class ImageMatchingTab(tk.Frame):
         # Run generate in a slight delay to allow UI to update
         self.after(100, _do_generate)
 
+    @staticmethod
+    def _iter_capcut_cache_dirs():
+        base = os.environ.get("LOCALAPPDATA", "")
+        if not base:
+            return []
+        # Keep this list conservative to mirror in-app cache cleanup behavior.
+        # Avoid deleting runtime-critical folders (e.g., Temp / Code Cache / GPUCache).
+        candidates = [
+            os.path.join(base, "CapCut", "User Data", "Cache"),
+            os.path.join(base, "CapCut", "User Data", "Caches"),
+            os.path.join(base, "CapCut", "User Data", "ProjectCache"),
+        ]
+        existing = []
+        for p in candidates:
+            if os.path.isdir(p):
+                existing.append(p)
+        return existing
+
+    @staticmethod
+    def _clear_capcut_cache():
+        deleted = 0
+        failed = 0
+        cache_dirs = ImageMatchingTab._iter_capcut_cache_dirs()
+        for cache_dir in cache_dirs:
+            try:
+                for name in os.listdir(cache_dir):
+                    target = os.path.join(cache_dir, name)
+                    try:
+                        if os.path.isdir(target) and not os.path.islink(target):
+                            shutil.rmtree(target)
+                        else:
+                            os.remove(target)
+                        deleted += 1
+                    except Exception:
+                        failed += 1
+            except Exception:
+                failed += 1
+        return deleted, failed, len(cache_dirs), False
+
     def _on_show_all_toggle(self):
         show_all = getattr(self, '_show_all_results', False)
         self._show_all_results = not show_all
         self.matching_table.update_results(self.match_results, self.image_index, show_all=self._show_all_results)
 
     def _chain_to_motion(self):
-        if self.generated_path and self.on_chain_to_motion:
+        if not self.on_chain_to_motion:
+            return
+        if self.draft_files:
+            self.on_chain_to_motion(self.draft_files)
+        elif self.generated_path:
             self.on_chain_to_motion(self.generated_path)
 
     def _reset(self):
         self.draft_data = None
         self.draft_path = None
+        self.draft_files = []
+        self.draft_data_map = {}
         self.image_folder = None
         self.subtitles = []
         self.image_index = {}
@@ -1556,7 +1689,9 @@ class MotionTab(tk.Frame):
     def __init__(self, parent, **kwargs):
         super().__init__(parent, bg=COLORS['bg'], **kwargs)
         self.input_file = None
+        self.input_files = []
         self.clip_count = 0
+        self.image_count = 0
         self.update_timer = None
         self.source_indicator = None
 
@@ -1842,41 +1977,94 @@ class MotionTab(tk.Frame):
     # File handling
 
     def _on_file_select(self, path):
-        self._load_file(path, source="upload")
+        self._load_files([path], source="upload")
 
     def load_file(self, path, source="upload"):
         """Public method to load file (used by chaining from Tab 1)"""
-        self.drop_zone.set_path(path)
-        self._load_file(path, source)
+        self._set_drop_path_silent(path)
+        self._load_files([path], source)
 
-    def _load_file(self, path, source="upload"):
-        if not path.lower().endswith('.json'):
-            messagebox.showwarning("Invalid File",
-                                   "Only .json files are supported.")
+    def load_files(self, paths, source="upload"):
+        """Public method to load multiple files/folders."""
+        if not paths:
             return
-        self.input_file = path
+        self._set_drop_path_silent(paths[0])
+        self._load_files(paths, source)
+
+    def _set_drop_path_silent(self, path):
+        """Update drop-zone UI without re-triggering on_select callback."""
+        original_cb = self.drop_zone.on_select
+        self.drop_zone.on_select = None
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            tracks = data.get("tracks", [])
-            if not tracks:
-                messagebox.showwarning("Warning", "No 'tracks' found.")
-                return
-            count = 0
-            has_video = False
-            for track in tracks:
-                if track.get("type") == "video":
-                    has_video = True
-                    count += len(track.get("segments", []))
-            if not has_video:
-                messagebox.showwarning("Warning", "No video tracks found.")
-                return
-            self.clip_count = count
+            self.drop_zone.set_path(path)
+        finally:
+            self.drop_zone.on_select = original_cb
+
+    def _load_files(self, paths, source="upload"):
+        input_files = []
+        seen = set()
+        for path in paths:
+            if not path:
+                continue
+            if os.path.isdir(path):
+                for draft_path in self._find_draft_files(path):
+                    if draft_path not in seen:
+                        input_files.append(draft_path)
+                        seen.add(draft_path)
+            elif path.lower().endswith('.json'):
+                # If a single draft_content.json is selected, include sibling
+                # timeline drafts under the same project folder as well.
+                if os.path.basename(path).lower() == "draft_content.json":
+                    project_folder = os.path.dirname(path)
+                    for draft_path in self._find_draft_files(project_folder):
+                        if draft_path not in seen:
+                            input_files.append(draft_path)
+                            seen.add(draft_path)
+                if path not in seen:
+                    input_files.append(path)
+                    seen.add(path)
+
+        if not input_files:
+            messagebox.showwarning("Invalid Input",
+                                   "No draft_content.json files found.")
+            return
+
+        total_clips = 0
+        per_file_clips = []
+        valid_files = []
+        try:
+            for path in input_files:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                tracks = data.get("tracks", [])
+                if not tracks:
+                    continue
+                count = 0
+                has_video = False
+                for track in tracks:
+                    if track.get("type") == "video":
+                        has_video = True
+                        count += len(track.get("segments", []))
+                if not has_video:
+                    continue
+                valid_files.append(path)
+                total_clips += count
+                per_file_clips.append(count)
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load:\n{e}")
             return
 
-        self.apply_btn.config(text=f"APPLY MOTION  ({self.clip_count} clips)  ->")
+        if not valid_files:
+            messagebox.showwarning("Warning", "No valid video tracks found.")
+            return
+
+        self.input_files = valid_files
+        self.input_file = valid_files[0]
+        self.clip_count = total_clips
+        self.image_count = max(per_file_clips) if per_file_clips else 0
+
+        self.apply_btn.config(
+            text=f"APPLY MOTION  ({self.image_count} images)  ->")
 
         if source == "chain":
             self.source_label.config(
@@ -1886,13 +2074,23 @@ class MotionTab(tk.Frame):
             self.source_label.config(text="")
 
         self.status_label.config(
-            text=f"Ready - {self.clip_count} clips",
+            text=f"Ready - {self.image_count} images",
             fg=COLORS['success'])
+
+    def _find_draft_files(self, project_folder):
+        drafts = []
+        for root, _, files in os.walk(project_folder):
+            if "draft_content.json" in files:
+                drafts.append(os.path.join(root, "draft_content.json"))
+        drafts.sort(key=lambda p: (p.count(os.sep), p.lower()))
+        return drafts
 
     def _reset_motion(self):
         """Reset motion tab to initial state"""
         self.input_file = None
+        self.input_files = []
         self.clip_count = 0
+        self.image_count = 0
         self.drop_zone._reset()
         self.source_label.config(text="")
         self.apply_btn.config(text="APPLY MOTION  ->")
@@ -1901,39 +2099,45 @@ class MotionTab(tk.Frame):
     # Motion application
 
     def apply_motion(self):
-        if not self.input_file:
+        if not self.input_files:
             messagebox.showerror("Error", "Please select a file first.")
             return
         try:
             self.status_label.config(text="Processing...",
                                      fg=COLORS['warning'])
             self.update()
-            self._create_backup()
-
-            with open(self.input_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            count = self._process_segments(data)
-
-            with open(self.input_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            total_count = 0
+            processed_files = 0
+            per_file_counts = []
+            for path in self.input_files:
+                self._create_backup(path)
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                count = self._process_segments(data)
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                total_count += count
+                processed_files += 1
+                per_file_counts.append((path, count))
+            display_images = max((c for _, c in per_file_counts), default=0)
 
             self.status_label.config(
-                text=f"Applied to {count} clips",
+                text=f"Applied to {display_images} images",
                 fg=COLORS['success'])
             messagebox.showinfo(
                 "Success",
-                f"Motion applied to {count} clips.\n"
+                f"Motion applied to {display_images} images.\n"
                 f"Backup saved in backups/ folder.")
         except Exception as e:
             self.status_label.config(text="Error", fg=COLORS['error'])
             messagebox.showerror("Error", str(e))
 
-    def _create_backup(self):
-        backup_dir = Path(self.input_file).parent / "backups"
+    def _create_backup(self, input_path):
+        backup_dir = Path(input_path).parent / "backups"
         backup_dir.mkdir(exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         dst = backup_dir / f"draft_backup_{ts}.json"
-        with open(self.input_file, "r", encoding="utf-8") as s:
+        with open(input_path, "r", encoding="utf-8") as s:
             with open(dst, "w", encoding="utf-8") as d:
                 d.write(s.read())
 
@@ -1948,6 +2152,7 @@ class MotionTab(tk.Frame):
         emin = self.end_scale_min.get() / 100.0
         emax = self.end_scale_max.get() / 100.0
         ps = self.pan_strength.get()
+        motion_props = {"KFTypePositionX", "KFTypePositionY", "KFTypeScaleX", "KFTypeScaleY", "KFTypeUniformScale"}
 
         for track in data.get("tracks", []):
             if track.get("type") != "video":
@@ -1961,15 +2166,34 @@ class MotionTab(tk.Frame):
                 s_x, e_x = MotionEngine.compute_pan_axis(ph, ps)
                 s_y, e_y = MotionEngine.compute_pan_axis(pv, ps)
 
-                if "clip" in seg:
-                    seg["clip"]["scale"] = {"x": s_s, "y": s_s}
-                    seg["clip"]["transform"] = {"x": s_x, "y": s_y}
+                if "clip" not in seg or not isinstance(seg.get("clip"), dict):
+                    seg["clip"] = {}
+                seg["clip"]["scale"] = {"x": s_s, "y": s_s}
+                seg["clip"]["transform"] = {"x": s_x, "y": s_y}
+                if "rotation" not in seg["clip"]:
+                    seg["clip"]["rotation"] = 0.0
+                if "flip" not in seg["clip"]:
+                    seg["clip"]["flip"] = {"vertical": False, "horizontal": False}
 
-                seg["common_keyframes"] = [
+                # Keep uniform scale enabled but sync its baseline with start scale.
+                if "uniform_scale" not in seg or not isinstance(seg.get("uniform_scale"), dict):
+                    seg["uniform_scale"] = {"on": True, "value": s_s}
+                else:
+                    seg["uniform_scale"]["on"] = True
+                    seg["uniform_scale"]["value"] = s_s
+
+                existing = [
+                    kf for kf in seg.get("common_keyframes", [])
+                    if kf.get("property_type") not in motion_props
+                ]
+                motion_keyframes = [
                     self._kf("KFTypePositionX", s_x, e_x, duration),
                     self._kf("KFTypePositionY", s_y, e_y, duration),
                     self._kf("KFTypeScaleX", s_s, e_s, duration),
+                    self._kf("KFTypeScaleY", s_s, e_s, duration),
+                    self._kf("KFTypeUniformScale", s_s, e_s, duration),
                 ]
+                seg["common_keyframes"] = existing + motion_keyframes
                 count += 1
         return count
 
@@ -2115,10 +2339,13 @@ class CapCutFactory:
         self.motion_tab._reset_motion()
         self._switch_tab(0)
 
-    def _chain_to_motion(self, draft_path):
+    def _chain_to_motion(self, draft_paths):
         """Called by Tab 1 to send generated draft to Tab 2"""
         self._switch_tab(1)
-        self.motion_tab.load_file(draft_path, source="chain")
+        if isinstance(draft_paths, list):
+            self.motion_tab.load_files(draft_paths, source="chain")
+        else:
+            self.motion_tab.load_file(draft_paths, source="chain")
 
     def _init_drag_and_drop(self):
         if DND_BACKEND == "tkinterdnd2":
@@ -2159,9 +2386,9 @@ class CapCutFactory:
             if path.lower().endswith('.json'):
                 self.motion_tab.load_file(path)
             elif os.path.isdir(path):
-                draft_file = os.path.join(path, "draft_content.json")
-                if os.path.isfile(draft_file):
-                    self.motion_tab.load_file(draft_file)
+                draft_files = self.image_tab._find_draft_files(path)
+                if draft_files:
+                    self.motion_tab.load_files(draft_files)
 
 
 # ============================================================
